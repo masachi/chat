@@ -1,12 +1,12 @@
 # Tinode Instant Messaging Server
 
-Instant messaging server. Backend in pure [Go](http://golang.org) (license [GPL 3.0](http://www.gnu.org/licenses/gpl-3.0.en.html)), custom client-side binding in Java and Javascript, as well as [gRPC](https://grpc.io/) client support for C++, C#, Go, Java, Node, PHP, Python, Ruby, Objective-C (license [Apache 2.0](http://www.apache.org/licenses/LICENSE-2.0)). Wire transport is JSON over websocket (long polling is also available) for custom bindings, or [protobuf](https://developers.google.com/protocol-buffers/) over plain TCP for gRPC. Persistent storage [RethinkDB](http://rethinkdb.com/), other databases can be supported by writing adapters.
+Instant messaging server. Backend in pure [Go](http://golang.org) (license [GPL 3.0](http://www.gnu.org/licenses/gpl-3.0.en.html)), custom client-side binding in Java and Javascript, as well as [gRPC](https://grpc.io/) client support for C++, C#, Go, Java, Node, PHP, Python, Ruby, Objective-C (license [Apache 2.0](http://www.apache.org/licenses/LICENSE-2.0)). Wire transport is JSON over websocket (long polling is also available) for custom bindings, or [protobuf](https://developers.google.com/protocol-buffers/) over plain TCP for gRPC. Persistent storage [RethinkDB](http://rethinkdb.com/) and MySQL (experimental). A third-party [DynamoDB adapter](https://github.com/riandyrn/chat/tree/master/server/db/dynamodb) also exists. Other databases can be supported by writing custom adapters.
 
-Tinode is meant as a replacement for XMPP. Overall it's a lot like open source WhatsApp or Telegram.
+Tinode is meant as a replacement for XMPP. On the surface it's a lot like open source WhatsApp or Telegram.
 
 Version 0.14. This is beta-quality software: feature-complete but probably with a few bugs. Follow [instructions](INSTALL.md) to install and run. Read [API documentation](API.md).
 
-A javascript demo is (usually) available at https://api.tinode.co/x/example-react-js/ ([source](https://github.com/tinode/example-react-js/)). Login as one of `alice`, `bob`, `carol`, `dave`, `frank`. Password is `<login>123`, e.g. login for `alice` is `alice123`. You can discover other users by email or phone by prefixing them with `email:` or `tel:` respectively. Emails are `<login>@example.com`, e.g. `alice@example.com`, phones are `17025550001` through `17025550009`. The demo server is reset (all data wiped) every night at 3:15 am Pacific time.
+A javascript demo is usually available at https://api.tinode.co/x/example-react-js/ ([source](https://github.com/tinode/example-react-js/)). Login as one of `alice`, `bob`, `carol`, `dave`, `frank`. Password is `<login>123`, e.g. login for `alice` is `alice123`. You can discover other users by email or phone by prefixing them with `email:` or `tel:` respectively. Emails are `<login>@example.com`, e.g. `alice@example.com`, phones are `17025550001` through `17025550009`. The demo server is reset (all data wiped) every night at 3:15 am Pacific time. If you see an error message `User not found or offline`, it means the server was reset while you were connected. If yu see it just reload and relogin.
 
 User `Tino` is a [basic chatbot](./chatbot) which responds with a [random quote](http://fortunes.cat-v.org/) to any message.
 
@@ -27,12 +27,12 @@ The demo server is configured to use [ACME](https://letsencrypt.org/) TLS [imple
 
 * [Android](https://github.com/tinode/android-example/), [web](https://github.com/tinode/example-react-js/), and [command line](tn-cli/) clients.
 * One-on-one messaging.
-* Group messaging with currently unlimited number of members where every member's access permissions are managed individually. The maximum number of members will be limited to a reasonably high value in the future (256? configurable?).
+* Group messaging with every member's access permissions managed individually. The maximum number of members is configurable (128 by default).
 * Topic access control with permissions for various actions.
 * Server-generated presence notifications for people, topics.
 * Sharded clustering with failover.
 * Persistent message store, paginated message history.
-* Javascript bindings with no dependencies.
+* Javascript bindings with no external dependencies.
 * Java bindings (dependencies: [jackson](https://github.com/FasterXML/jackson), [nv-websocket-client](https://github.com/TakahikoKawasaki/nv-websocket-client)). Suitable for Android but with no Android SDK dependencies.
 * Websocket, long polling, and [gRPC](https://grpc.io/) over TCP transports.
 * JSON or [protobuf version 3](https://developers.google.com/protocol-buffers/) wire protocols.
@@ -51,13 +51,12 @@ The demo server is configured to use [ACME](https://letsencrypt.org/) TLS [imple
 ### Planned
 
 * iOS client bindings and client.
-* Video and other media transfer.
+* Options for transfer of large objects like video.
 * End to end encryption with [OTR](https://en.wikipedia.org/wiki/Off-the-Record_Messaging) for one-on-one messaging and undecided method for group messaging.
 * Group messaging with unlimited number of members with bearer token access control.
 * Hot standby.
 * Federation.
 * Different levels of message persistence (from strict persistence to "store until delivered" to purely ephemeral messaging).
-* Support for other SQL and NoSQL backends.
 
 ## Screenshots
 

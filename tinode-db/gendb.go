@@ -9,26 +9,19 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/tinode/chat/server/auth_basic"
-	_ "github.com/tinode/chat/server/db/rethinkdb"
+	_ "github.com/tinode/chat/server/auth/basic"
 	"github.com/tinode/chat/server/store"
 	"github.com/tinode/chat/server/store/types"
 )
 
-func genRethink(reset bool, dbsource string, data *Data) {
+func genDb(reset bool, dbsource string, data *Data) {
 	var err error
 
-	log.Println("Opening DB...")
-
-	err = store.Open(dbsource)
-	if err != nil {
-		log.Fatal("Failed to connect to DB: ", err)
-	}
 	defer store.Close()
 
 	log.Println("Initializing DB...")
 
-	err = store.InitDb(reset)
+	err = store.InitDb(dbsource, reset)
 	if err != nil {
 		if strings.Contains(err.Error(), " already exists") {
 			log.Println("DB already exists, NOT reinitializing")
@@ -283,13 +276,13 @@ func getCreatedTime(delta string) time.Time {
 }
 
 type photoStruct struct {
-	Type string `gorethink:"type"`
-	Data []byte `gorethink:"data"`
+	Type string `json:"type" db:"type"`
+	Data []byte `json:"data" db:"data"`
 }
 
 type vcard struct {
-	Fn    string       `gorethink:"fn"`
-	Photo *photoStruct `gorethink:"photo,omitempty"`
+	Fn    string       `json:"fn" db:"fn"`
+	Photo *photoStruct `json:"photo,omitempty" db:"photo"`
 }
 
 // {"fn": "Alice Johnson", "photo": "alice-128.jpg"}

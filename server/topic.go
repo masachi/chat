@@ -12,6 +12,7 @@ import (
 	"errors"
 	"log"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -338,7 +339,7 @@ func (t *Topic) run(hub *Hub) {
 					continue
 				}
 
-				// "what" may have changed - "+command" removed ("on+add" -> "on")
+				// "what" may have changed, i.e. unset or "+command" removed ("on+en" -> "on")
 				msg.Pres.What = what
 			} else if msg.Info != nil {
 				if t.isSuspended() {
@@ -613,6 +614,7 @@ func (t *Topic) handleSubscription(h *Hub, sreg *sessionJoin) error {
 			// User online: notify users of interest
 			t.presUsersOfInterest("on", sreg.sess.userAgent)
 		} else if t.cat == types.TopicCatGrp || t.cat == types.TopicCatP2P {
+			var enable string
 			if sreg.created {
 				// Notify creator's other sessions that the topic was created.
 				t.presSingleUserOffline(sreg.sess.uid, "acs",
@@ -638,13 +640,22 @@ func (t *Topic) handleSubscription(h *Hub, sreg *sessionJoin) error {
 					// We don't know if the current user is online in the 'me' topic,
 					// so sending an '?unkn' status to user2. His 'me' topic
 					// will report user2's status and request an actual status from user1.
-					t.presSingleUserOffline(user2, "?unkn+add", nilPresParams, "", false)
+					if (pud2.modeGiven & pud2.modeWant).IsPresencer() {
+						// If user2 should receive notifications, enable it.
+						enable = "+en"
+					}
+					t.presSingleUserOffline(user2, "?unkn"+enable, nilPresParams, "", false)
+				} else if t.cat == types.TopicCatGrp {
+					// Enable notifications for a new topic, if appropriate
+					if (pud.modeGiven & pud.modeWant).IsPresencer() {
+						enable = "+en"
+					}
 				}
 			}
 
 			if t.cat == types.TopicCatGrp {
 				// Notify topic subscribers that the topic is online now.
-				t.presSubsOffline("on", nilPresParams, 0, "", false)
+				t.presSubsOffline("on"+enable, nilPresParams, 0, "", false)
 			}
 		}
 	} else if t.cat == types.TopicCatGrp && pud.online == 1 {
@@ -654,17 +665,30 @@ func (t *Topic) handleSubscription(h *Hub, sreg *sessionJoin) error {
 
 	if getWhat&constMsgMetaSub != 0 {
 		// Send get.sub response as a separate {meta} packet
-		t.replyGetSub(sreg.sess, sreg.pkt.Id, sreg.pkt.Get.Sub)
+		if err := t.replyGetSub(sreg.sess, sreg.pkt.Id, sreg.pkt.Get.Sub); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Sub failed: %v", t.name, err)
+		}
+	}
+
+	if getWhat&constMsgMetaTags != 0 {
+		// Send get.tags response as a separate {meta} packet
+		if err := t.replyGetTags(sreg.sess, sreg.pkt.Id); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Tags failed: %v", t.name, err)
+		}
 	}
 
 	if getWhat&constMsgMetaData != 0 {
 		// Send get.data response as {data} packets
-		t.replyGetData(sreg.sess, sreg.pkt.Id, sreg.pkt.Get.Data)
+		if err := t.replyGetData(sreg.sess, sreg.pkt.Id, sreg.pkt.Get.Data); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Data failed: %v", t.name, err)
+		}
 	}
 
 	if getWhat&constMsgMetaDel != 0 {
 		// Send get.del response as a separate {meta} packet
-		t.replyGetDel(sreg.sess, sreg.pkt.Id, sreg.pkt.Get.Del)
+		if err := t.replyGetDel(sreg.sess, sreg.pkt.Id, sreg.pkt.Get.Del); err != nil {
+			log.Printf("topic[%s] handleSubscription Get.Del failed: %v", t.name, err)
+		}
 	}
 	return nil
 }
@@ -721,7 +745,9 @@ func (t *Topic) subCommonReply(h *Hub, sreg *sessionJoin, sendDesc bool) error {
 		if sreg.created {
 			tmpName = sreg.pkt.Topic
 		}
-		t.replyGetDesc(sreg.sess, sreg.pkt.Id, tmpName, sreg.pkt.Get.Desc)
+		if err := t.replyGetDesc(sreg.sess, sreg.pkt.Id, tmpName, sreg.pkt.Get.Desc); err != nil {
+			log.Printf("topic[%s] subCommonReply Get.Desc failed: %v", t.name, err)
+		}
 	}
 
 	return nil
@@ -764,6 +790,12 @@ func (t *Topic) requestSub(h *Hub, sess *Session, pktID string, want string,
 	// It could be an actual subscription (IsJoiner() == true) or a ban (IsJoiner() == false)
 	userData, existingSub := t.perUser[sess.uid]
 	if !existingSub {
+
+		// Check if the max number of subscriptions is already reached.
+		if t.cat == types.TopicCatGrp && len(t.perUser) >= globals.maxSubscriberCount {
+			sess.queueOut(ErrPolicy(pktID, t.original(sess.uid), now))
+			return errors.New("max subscription count exceeded")
+		}
 
 		userData.private = private
 
@@ -889,12 +921,11 @@ func (t *Topic) requestSub(h *Hub, sess *Session, pktID string, want string,
 		// Save changes to DB
 		if userData.modeWant != oldWant || userData.modeGiven != oldGiven {
 			update := map[string]interface{}{}
-			// FIXME(gene): gorethink has a bug which causes ModeXYZ to be saved as a string, converting to int
 			if userData.modeWant != oldWant {
-				update["ModeWant"] = int(userData.modeWant)
+				update["ModeWant"] = userData.modeWant
 			}
 			if userData.modeGiven != oldGiven {
-				update["ModeGiven"] = int(userData.modeGiven)
+				update["ModeGiven"] = userData.modeGiven
 			}
 			if err := store.Subs.Update(t.name, sess.uid, update); err != nil {
 				sess.queueOut(ErrUnknown(pktID, t.original(sess.uid), now))
@@ -909,10 +940,9 @@ func (t *Topic) requestSub(h *Hub, sess *Session, pktID string, want string,
 			oldOwnerData.modeGiven = (oldOwnerData.modeGiven & ^types.ModeOwner)
 			oldOwnerData.modeWant = (oldOwnerData.modeWant & ^types.ModeOwner)
 			if err := store.Subs.Update(t.name, t.owner,
-				// FIXME(gene): gorethink has a bug which causes ModeXYZ to be saved as a string, converting to int
 				map[string]interface{}{
-					"ModeWant":  int(oldOwnerData.modeWant),
-					"ModeGiven": int(oldOwnerData.modeGiven)}); err != nil {
+					"ModeWant":  oldOwnerData.modeWant,
+					"ModeGiven": oldOwnerData.modeGiven}); err != nil {
 				return err
 			}
 			t.perUser[t.owner] = oldOwnerData
@@ -920,9 +950,10 @@ func (t *Topic) requestSub(h *Hub, sess *Session, pktID string, want string,
 		}
 	}
 
-	// If topic is being muted, notify before applying the new permissions.
+	// If topic is being muted, send "off" notification and disable updates.
+	// DO it before applying the new permissions.
 	if (oldWant & oldGiven).IsPresencer() && !(userData.modeWant & userData.modeGiven).IsPresencer() {
-		t.presSingleUserOffline(sess.uid, "off", nilPresParams, "", false)
+		t.presSingleUserOffline(sess.uid, "off+dis", nilPresParams, "", false)
 	}
 
 	// Apply changes.
@@ -941,11 +972,11 @@ func (t *Topic) requestSub(h *Hub, sess *Session, pktID string, want string,
 	}
 
 	// If this is a new subscription or the topic is being un-muted, notify after applying the changes.
-	if !existingSub ||
-		(!(oldWant & oldGiven).IsPresencer() && (userData.modeWant & userData.modeGiven).IsPresencer()) {
-		// Notify new subscriber of topic's online status.
-		log.Printf("topic[%s] sending ?unkn+add to me[%s]", t.name, sess.uid.String())
-		t.presSingleUserOffline(sess.uid, "?unkn+add", nilPresParams, "", false)
+	if (userData.modeWant & userData.modeGiven).IsPresencer() &&
+		(!existingSub || !(oldWant & oldGiven).IsPresencer()) {
+		// Notify subscriber of topic's online status.
+		// log.Printf("topic[%s] sending ?unkn+en to me[%s]", t.name, sess.uid.String())
+		t.presSingleUserOffline(sess.uid, "?unkn+en", nilPresParams, "", false)
 	}
 
 	// If something has changed and the requested access mode is different from the given, notify topic admins.
@@ -1037,6 +1068,12 @@ func (t *Topic) approveSub(h *Hub, sess *Session, target types.Uid, set *MsgClie
 	// Saved subscription does not mean the user is allowed to post/read
 	userData, existingSub := t.perUser[target]
 	if !existingSub {
+
+		// Check if the max number of subscriptions is already reached.
+		if t.cat == types.TopicCatGrp && len(t.perUser) >= globals.maxSubscriberCount {
+			sess.queueOut(ErrPolicy(set.Id, t.original(sess.uid), now))
+			return errors.New("max subscription count exceeded")
+		}
 
 		if modeGiven == types.ModeUnset {
 			// Request to use default access mode for the new subscriptions.
@@ -1130,7 +1167,7 @@ func (t *Topic) approveSub(h *Hub, sess *Session, target types.Uid, set *MsgClie
 
 // replyGetDesc is a response to a get.desc request on a topic, sent to just the session as a {meta} packet
 func (t *Topic) replyGetDesc(sess *Session, id, tempName string, opts *MsgGetOpts) error {
-	now := time.Now().UTC().Round(time.Millisecond)
+	now := types.TimeNow()
 
 	// Check if user requested modified data
 	ifUpdated := (opts == nil || opts.IfModifiedSince == nil || opts.IfModifiedSince.Before(t.updated))
@@ -1207,16 +1244,16 @@ func (t *Topic) replyGetDesc(sess *Session, id, tempName string, opts *MsgGetOpt
 // replySetDesc updates topic metadata, saves it to DB,
 // replies to the caller as {ctrl} message, generates {pres} update if necessary
 func (t *Topic) replySetDesc(sess *Session, set *MsgClientSet) error {
-	now := time.Now().UTC().Round(time.Millisecond)
+	now := types.TimeNow()
 
 	assignAccess := func(upd map[string]interface{}, mode *MsgDefaultAcsMode) error {
-		if auth, anon, err := parseTopicAccess(mode, types.ModeInvalid, types.ModeInvalid); err != nil {
+		if auth, anon, err := parseTopicAccess(mode, types.ModeUnset, types.ModeUnset); err != nil {
 			return err
 		} else if auth.IsOwner() || anon.IsOwner() {
 			return errors.New("default 'owner' access is not permitted")
 		} else {
-			access := make(map[string]interface{})
-			if auth != types.ModeInvalid {
+			access := types.DefaultAccess{Auth: t.accessAuth, Anon: t.accessAnon}
+			if auth != types.ModeUnset {
 				if t.cat == types.TopicCatMe {
 					auth &= types.ModeCP2P
 					if auth != types.ModeNone {
@@ -1225,18 +1262,18 @@ func (t *Topic) replySetDesc(sess *Session, set *MsgClientSet) error {
 						auth |= types.ModeApprove
 					}
 				}
-				access["Auth"] = auth
+				access.Auth = auth
 			}
-			if anon != types.ModeInvalid {
+			if anon != types.ModeUnset {
 				if t.cat == types.TopicCatMe {
 					anon &= types.ModeCP2P
 					if anon != types.ModeNone {
 						anon |= types.ModeApprove
 					}
 				}
-				access["Anon"] = anon
+				access.Anon = anon
 			}
-			if len(access) > 0 {
+			if access.Auth != t.accessAuth || access.Anon != t.accessAnon {
 				upd["Access"] = access
 			}
 		}
@@ -1260,17 +1297,9 @@ func (t *Topic) replySetDesc(sess *Session, set *MsgClientSet) error {
 
 	updateCached := func(upd map[string]interface{}) {
 		if tmp, ok := upd["Access"]; ok {
-			access := tmp.(map[string]interface{})
-			if auth, ok := access["Auth"]; ok {
-				if auth != types.ModeInvalid {
-					t.accessAuth = auth.(types.AccessMode)
-				}
-			}
-			if anon, ok := access["Anon"]; ok {
-				if anon != types.ModeInvalid {
-					t.accessAnon = anon.(types.AccessMode)
-				}
-			}
+			access := tmp.(types.DefaultAccess)
+			t.accessAuth = access.Auth
+			t.accessAnon = access.Anon
 		}
 		if public, ok := upd["Public"]; ok {
 			t.public = public
@@ -1292,25 +1321,13 @@ func (t *Topic) replySetDesc(sess *Session, set *MsgClientSet) error {
 			if set.Desc.Public != nil {
 				sendPres = assignGenericValues(user, "Public", set.Desc.Public)
 			}
-		} else if t.cat == types.TopicCatFnd {
-			// User's own tags are sent as fnd.public. Assign them to user.Tags
-			if set.Desc.Public != nil {
-				if src, ok := set.Desc.Public.([]string); ok && len(src) > 0 {
-					var tags []string
-					if tags = filterTags(tags, src); len(tags) > 0 {
-						// No need to send presence update
-						assignGenericValues(user, "Tags", tags)
-						t.public = tags
-					}
-				}
-			}
 		} else if t.cat == types.TopicCatP2P {
 			// Reject direct changes to P2P topics.
 			if set.Desc.Public != nil || set.Desc.DefaultAcs != nil {
 				sess.queueOut(ErrPermissionDenied(set.Id, set.Topic, now))
 				return errors.New("incorrect attempt to change metadata of a p2p topic")
 			}
-		} else {
+		} else if t.cat == types.TopicCatGrp {
 			// Update group topic
 			if set.Desc.DefaultAcs != nil || set.Desc.Public != nil {
 				if t.owner == sess.uid {
@@ -1327,6 +1344,7 @@ func (t *Topic) replySetDesc(sess *Session, set *MsgClientSet) error {
 				}
 			}
 		}
+		// else fnd: update ignored
 
 		if err != nil {
 			sess.queueOut(ErrMalformed(set.Id, set.Topic, now))
@@ -1403,10 +1421,22 @@ func (t *Topic) replyGetSub(sess *Session, id string, opts *MsgGetOpts) error {
 		subs, err = store.Users.GetTopicsAny(sess.uid)
 		isSharer = true
 	} else if t.cat == types.TopicCatFnd {
-		// Given a query provided in .private, fetch user's contacts
-		if query, ok := t.perUser[sess.uid].private.([]interface{}); ok {
-			if query != nil && len(query) > 0 {
-				subs, err = store.Users.FindSubs(sess.uid, query)
+		// Given a query provided in .private, fetch user's contacts. Private contains a slice of interfaces.
+		if ifquery, ok := t.perUser[sess.uid].private.([]interface{}); ok && len(ifquery) > 0 {
+			// Convert slice of interfaces to a slice of strings.
+			var query []string
+			for _, ifq := range ifquery {
+				switch str := ifq.(type) {
+				case string:
+					query = append(query, str)
+				default:
+				}
+			}
+			if len(query) > 0 {
+				query, subs, err = pluginFind(sess.uid, query)
+				if err == nil && subs == nil && query != nil {
+					subs, err = store.Users.FindSubs(sess.uid, query)
+				}
 			}
 		}
 	} else {
@@ -1435,7 +1465,7 @@ func (t *Topic) replyGetSub(sess *Session, id string, opts *MsgGetOpts) error {
 	}
 
 	meta := &MsgServerMeta{Id: id, Topic: t.original(sess.uid), Timestamp: &now}
-	if subs != nil && len(subs) > 0 {
+	if len(subs) > 0 {
 		meta.Sub = make([]MsgTopicSub, 0, len(subs))
 		idx := 0
 		for _, sub := range subs {
@@ -1508,11 +1538,14 @@ func (t *Topic) replyGetSub(sess *Session, id string, opts *MsgGetOpts) error {
 					deleted = true
 				}
 
-				// Reporting subscribers to a group or a p2p topic
+				// Reporting subscribers to fnd, a group or a p2p topic
 				mts.User = uid.UserId()
+				if t.cat == types.TopicCatFnd {
+					mts.Topic = sub.Topic
+				}
 				if !deleted {
 					if uid == sess.uid && isReader {
-						// Report deleted messages for own subscriptions only
+						// Report deleted ID for own subscriptions only
 						mts.DelId = sub.DelId
 					}
 
@@ -1551,7 +1584,6 @@ func (t *Topic) replyGetSub(sess *Session, id string, opts *MsgGetOpts) error {
 			} else if mts.DeletedAt == nil {
 				mts.DeletedAt = &sub.UpdatedAt
 			}
-
 			meta.Sub = append(meta.Sub, mts)
 			idx++
 		}
@@ -1611,7 +1643,7 @@ func (t *Topic) replySetSub(h *Hub, sess *Session, set *MsgClientSet) error {
 // replyGetData is a response to a get.data request - load a list of stored messages, send them to session as {data}
 // response goes to a single session rather than all sessions in a topic
 func (t *Topic) replyGetData(sess *Session, id string, req *MsgBrowseOpts) error {
-	now := time.Now().UTC().Round(time.Millisecond)
+	now := types.TimeNow()
 
 	// Check if the user has permission to read the topic data
 	if userData := t.perUser[sess.uid]; (userData.modeGiven & userData.modeWant).IsReader() {
@@ -1647,6 +1679,49 @@ func (t *Topic) replyGetData(sess *Session, id string, req *MsgBrowseOpts) error
 	reply := NoErr(id, t.original(sess.uid), now)
 	reply.Ctrl.Params = map[string]string{"what": "data"}
 	sess.queueOut(reply)
+
+	return nil
+}
+
+// replyGetTags returns topic's tags - tokens used for discovery.
+func (t *Topic) replyGetTags(sess *Session, id string) error {
+	return nil
+}
+
+// replySetTags updates topic's tags - tokens used for discovery.
+func (t *Topic) replySetTags(sess *Session, id string, set *MsgClientSet) error {
+	if len(set.Tags) == 0 {
+		return nil
+	}
+
+	now := types.TimeNow()
+	if t.cat != types.TopicCatMe && t.cat != types.TopicCatGrp {
+		sess.queueOut(ErrOperationNotAllowed(id, "", now))
+		return errors.New("invalid topic category assign tags")
+	}
+
+	var tags []string
+	if tags = normalizeTags(tags, set.Tags); len(tags) > 0 {
+		if len(tags) > globals.maxTagCount {
+			// If user sent too many tags, silently discard excessive tags.
+			tags = tags[:globals.maxTagCount]
+		}
+
+		var err error
+		if t.cat == types.TopicCatMe {
+			err = store.Users.UpdateTags(sess.uid, globals.uniqueTags, tags)
+		} else if t.cat == types.TopicCatGrp {
+			err = store.Topics.UpdateTags(t.name, globals.uniqueTags, tags)
+		}
+
+		if err != nil {
+			log.Println("Failed to update tags", err)
+			sess.queueOut(ErrUnknown(id, t.original(sess.uid), now))
+			return err
+		}
+	}
+
+	sess.queueOut(NoErr(id, t.original(sess.uid), now))
 
 	return nil
 }
@@ -1731,7 +1806,7 @@ func (t *Topic) replyDelMsg(sess *Session, del *MsgClientDel) error {
 			types.RangeSorter(ranges).Normalize()
 		}
 
-		if count > maxDeleteCount && len(ranges) > 1 {
+		if count > defaultMaxDeleteCount && len(ranges) > 1 {
 			err = errors.New("del.msg: too many messages to delete")
 		}
 	}
@@ -1939,7 +2014,7 @@ func (t *Topic) evictUser(uid types.Uid, unsub bool, skip string) {
 
 		if len(t.perUser) == 2 {
 			// Send an "off" notification to the user2 and ask it to stop sending updates to user1
-			presSingleUserOfflineOffline(t.p2pOtherUser(uid), uid.UserId(), "off+remove", 0, nilPresParams, "")
+			presSingleUserOfflineOffline(t.p2pOtherUser(uid), uid.UserId(), "off+rem", 0, nilPresParams, "")
 		}
 	}
 
@@ -2139,4 +2214,63 @@ func delrangeSerialize(in []MsgDelRange) []types.Range {
 	}
 
 	return out
+}
+
+// Trim whitespace, remove empty tags and duplicates, ensure proper format of prefixes.
+func normalizeTags(dst []string, src []string) []string {
+	if len(src) == 0 {
+		return dst
+	}
+
+	// Make sure the number of tags does not exceed the maximum.
+	// Technically it may result in fewer tags than the maximum due to empty tags and
+	// duplicates, but that's user's fault.
+	if len(src) > globals.maxTagCount {
+		src = src[:globals.maxTagCount]
+	}
+
+	// Trim whitespace and force to lowercase.
+	for i := 0; i < len(src); i++ {
+		src[i] = strings.ToLower(strings.TrimSpace(src[i]))
+	}
+
+	// Sort tags
+	sort.Strings(src)
+
+	// Remove short tags and de-dupe keeping the order. It may result in fewer tags than could have
+	// been if length were enforced later, but that's client's fault.
+	var prev string
+	for i := 0; i < len(src); {
+		curr := src[i]
+		if len(curr) < minTagLength || curr == prev {
+			// Re-slicing is not efficient but the slice is short so we don't care.
+			src = append(src[:i], src[i+1:]...)
+			continue
+		}
+		prev = curr
+		i++
+	}
+
+	// If prefixes are used, check their format.
+	// Copy to destination slice.
+	for i := 0; i < len(src); i++ {
+		parts := strings.SplitN(src[i], ":", 2)
+		if len(parts) < 2 {
+			// Not in "tag:value" format
+			dst = append(dst, src[i])
+			continue
+		}
+
+		// Skip invalid strings of the form "tag:" or ":value" or ":"
+		if parts[0], parts[1] = strings.TrimSpace(parts[0]),
+			strings.TrimSpace(parts[1]); parts[0] == "" || parts[1] == "" {
+			continue
+		}
+
+		// Add tag to output.
+		dst = append(dst, parts[0]+":"+parts[1])
+	}
+
+	// Because prefixes were forced to lowercase, the tags may be unsorted now.
+	return dst
 }

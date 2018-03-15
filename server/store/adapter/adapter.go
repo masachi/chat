@@ -13,6 +13,8 @@ type Adapter interface {
 	Open(config string) error
 	Close() error
 	IsOpen() bool
+	CheckDbVersion() error
+	GetName() string
 
 	CreateDb(reset bool) error
 
@@ -23,7 +25,6 @@ type Adapter interface {
 	UserDelete(id t.Uid, soft bool) error
 	UserUpdateLastSeen(uid t.Uid, userAgent string, when time.Time) error
 	//UserUpdateStatus(uid t.Uid, status interface{}) error
-	ChangePassword(id t.Uid, password string) error
 	UserUpdate(uid t.Uid, update map[string]interface{}) error
 
 	// Authentication management
@@ -63,8 +64,13 @@ type Adapter interface {
 	SubsDelete(topic string, user t.Uid) error
 	// SubsDelForTopic deletes all subscriptions to the given topic
 	SubsDelForTopic(topic string) error
-	// Search for new contacts given a list of tags
-	FindSubs(user t.Uid, query []interface{}) ([]t.Subscription, error)
+
+	// FindUsers searches for new contacts given a list of tags
+	FindUsers(user t.Uid, tags []string) ([]t.Subscription, error)
+	// FindTopics searches for group topics given a list of tags
+	FindTopics(tags []string) ([]t.Subscription, error)
+	UserTagsUpdate(user t.Uid, unique, tags t.StringSlice) error
+	TopicTagsUpdate(topic string, unique, tags t.StringSlice) error
 
 	// Messages
 	MessageSave(msg *t.Message) error

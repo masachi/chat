@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tinode/chat/pbx"
+	"github.com/tinode/chat/server/store/types"
 )
 
 func pbServCtrlSerialize(ctrl *MsgServerCtrl) *pbx.ServerMsg_Ctrl {
@@ -730,6 +731,36 @@ func pbTopicSubSliceDeserialize(subs []*pbx.TopicSub) []MsgTopicSub {
 				When:      int64ToTime(subs[i].GetLastSeenTime()),
 				UserAgent: subs[i].GetLastSeenUserAgent(),
 			}
+		}
+	}
+	return out
+}
+
+func pbSubSliceDeserialize(subs []*pbx.TopicSub) []types.Subscription {
+	if subs == nil || len(subs) == 0 {
+		return nil
+	}
+
+	out := make([]types.Subscription, len(subs))
+	for i := 0; i < len(subs); i++ {
+		out[i] = types.Subscription{
+			ObjHeader: types.ObjHeader{
+				UpdatedAt: *int64ToTime(subs[i].GetUpdatedAt()),
+				DeletedAt: int64ToTime(subs[i].GetDeletedAt()),
+			},
+			User:    subs[i].GetUserId(),
+			Topic:   subs[i].GetTopic(),
+			DelId:   int(subs[i].GetDelId()),
+			Private: bytesToInterface(subs[i].GetPrivate()),
+		}
+		out[i].SetPublic(bytesToInterface(subs[i].GetPublic()))
+		if acs := subs[i].GetAcs(); acs != nil {
+			out[i].ModeGiven.UnmarshalText([]byte(acs.GetGiven()))
+			out[i].ModeWant.UnmarshalText([]byte(acs.GetWant()))
+		}
+		if subs[i].GetLastSeenTime() > 0 {
+			out[i].SetLastSeenAndUA(int64ToTime(subs[i].GetLastSeenTime()),
+				subs[i].GetLastSeenUserAgent())
 		}
 	}
 	return out

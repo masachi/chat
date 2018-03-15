@@ -11,28 +11,39 @@
 
 FROM golang:latest
 
-MAINTAINER Gene Sokolov <gene@tinode.co>
+LABEL maintainer="Gene Sokolov <gene@tinode.co>"
+LABEL name="TinodeChatServer"
+LABEL version="0.14.1"
 
-RUN go get -tags rethinkdb github.com/tinode/chat/server \
-	&& go install -tags rethinkdb github.com/tinode/chat/server
+# Compiles for RethinkDB by default. Alternatively use `--build-arg TARGET_DB=mysql` to build for MySQL.
+ARG TARGET_DB=rethinkdb
+ENV TARGET_DB=$TARGET_DB
+
+# Build the binary.
+RUN go get -tags $TARGET_DB github.com/tinode/chat/server \
+	&& go install -tags $TARGET_DB -ldflags "-X main.buildstamp=${TARGET_DB}-`date -u '+%Y%m%dT%H:%M:%SZ'`" \
+		github.com/tinode/chat/server
 
 # Download the demo app and the js bindings
 RUN git clone --depth 1 https://github.com/tinode/example-react-js.git
 RUN git clone --depth 1 https://github.com/tinode/tinode-js.git
 
-# The demo app expects tinode.js to be in the same dir as the app, so create the link
+# The demo app expects tinode.js to be in the same dir as the app, so create the link.
 RUN ln tinode-js/tinode.js example-react-js/
 
 # Various encryption and salt keys. Replace with your own in production.
 
 # Key to initialize UID generator
-ENV UID_ENCRYPTION_KEY la6YsO+bNX/+XIkOqc5Svw==
+ENV UID_ENCRYPTION_KEY=la6YsO+bNX/+XIkOqc5Svw==
 
 # Key to sign API app ID.
-ENV API_KEY_SALT T713/rYYgW7g4m3vG6zGRh7+FM1t0T8j13koXScOAj4=
+ENV API_KEY_SALT=T713/rYYgW7g4m3vG6zGRh7+FM1t0T8j13koXScOAj4=
 
-#Key used to sign authentication tokens.
-ENV AUTH_TOKEN_KEY wfaY2RgF2S1OQI/ZlK+LSrp1KB2jwAdGAIHQ7JZn+Kc=
+# Key used to sign authentication tokens.
+ENV AUTH_TOKEN_KEY=wfaY2RgF2S1OQI/ZlK+LSrp1KB2jwAdGAIHQ7JZn+Kc=
+
+# Disable chatbot plugin by default. 
+ENV PLUGIN_PYTHON_CHAT_BOT_ENABLED=false
 
 # Copy config template to the container.
 COPY config.template /
@@ -42,4 +53,6 @@ RUN chmod +x /entrypoint.sh
 # Generate config from template and run the server.
 ENTRYPOINT ["/entrypoint.sh"]
 
-EXPOSE 18080
+# HTTP and gRPC ports
+EXPOSE 18080 16061
+

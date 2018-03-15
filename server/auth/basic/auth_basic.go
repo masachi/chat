@@ -1,4 +1,4 @@
-package auth_basic
+package basic
 
 // This handler must be kept in a separate package because it's referenced by
 // tinode-db
@@ -145,6 +145,5 @@ func (BasicAuth) GenSecret(uid types.Uid, authLvl int, lifetime time.Duration) (
 }
 
 func init() {
-	var auth BasicAuth
-	store.RegisterAuthScheme("basic", auth)
+	store.RegisterAuthScheme("basic", &BasicAuth{})
 }

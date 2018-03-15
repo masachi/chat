@@ -15,9 +15,13 @@ service Plugin {
 	// and forward it to the client session. 
 	// ServerCtrl.code equals to 0 instructs the server to continue with default processing of the client message.
   	rpc FireHose(ClientReq) returns (ServerResp) {}
-
-	// The following methods are for the Tinode server to report individual events.
 	
+	// An alteranative user and topic discovery mechanism. 
+	// A search request issued on a 'fnd' topic. This method is called to generate an alternative result set.
+	rpc Find(SearchQuery) returns (SearchFound) {}
+	
+	// The following methods are for the Tinode server to report individual events.
+		
 	// Account created, updated or deleted
 	rpc Account(AccountEvent) returns (Unused) {}
 	
@@ -31,7 +35,7 @@ service Plugin {
 	rpc Message(MessageEvent) returns (Unused) {}
 }
 
-// Dummy placeholder message
+// Dummy placeholder message.
 message Unused {
 }
 
@@ -365,20 +369,20 @@ message ServerMsg {
 	}
 }
 
+// Plugin response codes
+enum RespCode {
+	// Instruct Tinode server to continue with default processing of the client request.
+	CONTINUE = 0;
+	// Drop the request as if the client did not send it
+	DROP = 1;
+	// Send the the provided response to the client.
+	RESPOND = 2;
+	// Replace client's original request with the provided request then continue with 
+	// processing.
+	REPLACE = 3;
+}
 
 message ServerResp {
-	// Plugin response codes
-	enum RespCode {
-		// Instruct Tinode server to continue with default processing of the client message.
-		CONTINUE = 0;
-		// Drop the message as if the client did not send it
-		DROP = 1;
-		// Respond to client with the provided srvmsg
-		RESPOND = 2;
-		// Replace client's original message with the provided clmsg then continue with 
-		// processing.
-		REPLACE = 3;
-  	}
 	RespCode status = 1;
 	ServerMsg srvmsg = 2;
 	ClientMsg clmsg = 3;
@@ -404,6 +408,21 @@ message Session {
 message ClientReq {
 	ClientMsg msg = 1;
 	Session sess = 2;
+}
+
+// Search
+
+message SearchQuery {
+	string user_id = 1;
+	repeated string terms = 2;
+}
+
+message SearchFound {
+	RespCode status = 1;
+	// New search terms If status == REPLACE, otherwise unset.
+	repeated string terms = 2;
+	// Search results.
+	repeated TopicSub result = 3;
 }
 
 // CRUD event messages

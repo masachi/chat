@@ -23,11 +23,15 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/tinode/chat/push_fcm"
-	_ "github.com/tinode/chat/server/auth_basic"
+	gzip "github.com/gorilla/handlers"
+	_ "github.com/tinode/chat/server/auth/anon"
+	_ "github.com/tinode/chat/server/auth/basic"
+	_ "github.com/tinode/chat/server/auth/token"
+	_ "github.com/tinode/chat/server/db/mysql"
 	_ "github.com/tinode/chat/server/db/rethinkdb"
 	"github.com/tinode/chat/server/push"
-	_ "github.com/tinode/chat/server/push_stdout"
+	_ "github.com/tinode/chat/server/push/fcm"
+	_ "github.com/tinode/chat/server/push/stdout"
 	"github.com/tinode/chat/server/store"
 	"google.golang.org/grpc"
 )
@@ -43,31 +47,48 @@ const (
 	// minSupportedVersion is the minimum supported API version
 	minSupportedVersion = "0.14"
 
-	// maxMessageSize is the default maximum message size
-	maxMessageSize = 1 << 19 // 512K
+	// defaultMaxMessageSize is the default maximum message size
+	defaultMaxMessageSize = 1 << 19 // 512K
+
+	// defaultMaxSubscriberCount is the default maximum number of group topic subscribers.
+	// Also set in adapter.
+	defaultMaxSubscriberCount = 256
+
+	// defaultMaxTagCount is the default maximum number of indexable tags
+	defaultMaxTagCount = 16
+
+	// minTagLength is the shortest acceptable length of a tag
+	minTagLength = 4
 
 	// Delay before updating a User Agent
 	uaTimerDelay = time.Second * 5
 
 	// maxDeleteCount is the maximum allowed number of messages to delete in one call.
-	maxDeleteCount = 1024
+	defaultMaxDeleteCount = 1024
 )
 
-// Build timestamp set by the compiler
-var buildstamp = ""
+// Build timestamp defined by the compiler.
+// To define buildstamp as a timestamp of when the server was built add a flag to compiler command line:
+// 	-ldflags "-X main.buildstamp=`date -u '+%Y%m%dT%H:%M:%SZ'`"
+var buildstamp = "buildstamp-undefined"
 
 var globals struct {
-	hub           *Hub
-	sessionStore  *SessionStore
-	cluster       *Cluster
-	grpcServer    *grpc.Server
-	apiKeySalt    []byte
-	indexableTags []string
+	hub          *Hub
+	sessionStore *SessionStore
+	cluster      *Cluster
+	grpcServer   *grpc.Server
+	apiKeySalt   []byte
+	// Tags which are indexed as unique.
+	uniqueTags []string
 	// Add Strict-Transport-Security to headers, the value signifies age.
 	// Empty string "" turns it off
 	tlsStrictMaxAge string
 	// Maximum message size allowed from peer.
 	maxMessageSize int64
+	// Maximum number of group topic subscribers.
+	maxSubscriberCount int
+	// Maximum number of indexable tags.
+	maxTagCount int
 }
 
 // Contentx of the configuration file
@@ -88,8 +109,15 @@ type configType struct {
 	// Maximum message size allowed from client. Intended to prevent malicious client from sending
 	// very large files.
 	MaxMessageSize int `json:"max_message_size"`
-	// Tags allowed in index (user discovery)
-	IndexableTags []string                   `json:"indexable_tags"`
+	// Maximum number of group topic subscribers.
+	MaxSubscriberCount int `json:"max_subscriber_count"`
+	// Maximum number of indexable tags
+	MaxTagCount int `json:"max_tag_count"`
+	// Tags which must be unique, all other tags will be just
+	// indexed without uniqueness enforcement (user discovery)
+	UniqueTags []string `json:"unique_tags"`
+
+	// Configs for subsystems
 	ClusterConfig json.RawMessage            `json:"cluster_config"`
 	PluginConfig  json.RawMessage            `json:"plugins"`
 	StoreConfig   json.RawMessage            `json:"store_config"`
@@ -99,7 +127,7 @@ type configType struct {
 }
 
 func main() {
-	log.Printf("Server v%s:%s pid=%d started with processes: %d", currentVersion, buildstamp, os.Getpid(),
+	log.Printf("Server 'v%s:%s'; pid %d; started with %d process(es)", currentVersion, buildstamp, os.Getpid(),
 		runtime.GOMAXPROCS(runtime.NumCPU()))
 
 	var configfile = flag.String("config", "./tinode.conf", "Path to config file.")
@@ -111,13 +139,13 @@ func main() {
 	var clusterSelf = flag.String("cluster_self", "", "Override the name of the current cluster node")
 	flag.Parse()
 
-	log.Printf("Using config from: '%s'", *configfile)
+	log.Printf("Using config from '%s'", *configfile)
 
 	var config configType
 	if raw, err := ioutil.ReadFile(*configfile); err != nil {
-		log.Fatal(err)
+		log.Fatal("Failed to read config file:", err)
 	} else if err = json.Unmarshal(raw, &config); err != nil {
-		log.Fatal(err)
+		log.Fatal("Failed to parse config file:", err)
 	}
 
 	if *listenOn != "" {
@@ -126,7 +154,7 @@ func main() {
 
 	var err = store.Open(string(config.StoreConfig))
 	if err != nil {
-		log.Fatal("Failed to connect to DB: ", err)
+		log.Fatal("Failed to connect to DB:", err)
 	}
 	defer func() {
 		store.Close()
@@ -161,12 +189,22 @@ func main() {
 	pluginsInit(config.PluginConfig)
 	// API key validation secret
 	globals.apiKeySalt = config.APIKeySalt
-	// Indexable tags for user discovery
-	globals.indexableTags = config.IndexableTags
+	// List of indexable tags for user discovery treated as globally unique.
+	globals.uniqueTags = config.UniqueTags
 	// Maximum message size
 	globals.maxMessageSize = int64(config.MaxMessageSize)
 	if globals.maxMessageSize <= 0 {
-		globals.maxMessageSize = maxMessageSize
+		globals.maxMessageSize = defaultMaxMessageSize
+	}
+	// Maximum number of group topic subscribers
+	globals.maxSubscriberCount = config.MaxSubscriberCount
+	if globals.maxSubscriberCount <= 1 {
+		globals.maxSubscriberCount = defaultMaxSubscriberCount
+	}
+	// Maximum number of indexable tags per user or topics
+	globals.maxTagCount = config.MaxTagCount
+	if globals.maxTagCount <= 0 {
+		globals.maxTagCount = defaultMaxTagCount
 	}
 
 	// Serve static content from the directory in -static_data flag if that's
@@ -192,15 +230,20 @@ func main() {
 			staticMountPoint = staticMountPoint + "/"
 		}
 	}
-	http.Handle(staticMountPoint, http.StripPrefix(staticMountPoint,
-		hstsHandler(http.FileServer(http.Dir(staticContent)))))
+	http.Handle(staticMountPoint,
+		// Add gzip compression
+		gzip.CompressHandler(
+			// Remove mount point prefix
+			http.StripPrefix(staticMountPoint,
+				// Optionally add Strict-Transport_security to the response
+				hstsHandler(http.FileServer(http.Dir(staticContent))))))
 	log.Printf("Serving static content from '%s' at '%s'", staticContent, staticMountPoint)
 
 	// Configure HTTP channels
 	// Handle websocket clients.
 	http.HandleFunc("/v0/channels", serveWebSocket)
-	// Handle long polling clients.
-	http.HandleFunc("/v0/channels/lp", serveLongPoll)
+	// Handle long polling clients. Enable compression.
+	http.Handle("/v0/channels/lp", gzip.CompressHandler(http.HandlerFunc(serveLongPoll)))
 	// Serve json-formatted 404 for all other URLs
 	http.HandleFunc("/", serve404)
 

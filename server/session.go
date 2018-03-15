@@ -579,7 +579,7 @@ func (s *Session) acc(msg *ClientComMessage) {
 
 		if len(msg.Acc.Tags) > 0 {
 			var tags []string
-			if tags = filterTags(tags, msg.Acc.Tags); len(tags) > 0 {
+			if tags = normalizeTags(tags, msg.Acc.Tags); len(tags) > 0 {
 				user.Tags = tags
 			}
 		}
@@ -657,18 +657,6 @@ func (s *Session) acc(msg *ClientComMessage) {
 			log.Println("Unknown auth scheme", msg.Acc.Scheme)
 			s.queueOut(ErrMalformed(msg.Acc.Id, "", msg.timestamp))
 			return
-		}
-
-		// Tags updated
-		if len(msg.Acc.Tags) > 0 {
-			var tags []string
-			if tags = filterTags(tags, msg.Acc.Tags); len(tags) > 0 {
-				if err := store.Users.Update(s.uid, map[string]interface{}{"Tags": tags}); err != nil {
-					log.Println("Failed to update tags", err)
-					s.queueOut(ErrUnknown(msg.Acc.Id, "", msg.timestamp))
-					return
-				}
-			}
 		}
 
 		s.queueOut(NoErr(msg.Acc.Id, "", msg.timestamp))
@@ -751,6 +739,9 @@ func (s *Session) set(msg *ClientComMessage) {
 		}
 		if msg.Set.Sub != nil {
 			meta.what |= constMsgMetaSub
+		}
+		if msg.Set.Tags != nil {
+			meta.what |= constMsgMetaTags
 		}
 		if meta.what == 0 {
 			s.queueOut(ErrMalformed(msg.Set.Id, msg.Set.Topic, msg.timestamp))
@@ -925,29 +916,6 @@ func (s *Session) serialize(msg *ServerComMessage) interface{} {
 	}
 	out, _ := json.Marshal(msg)
 	return out
-}
-
-func filterTags(dst []string, src []string) []string {
-	if len(globals.indexableTags) == 0 {
-		return dst
-	}
-
-	for _, s := range src {
-		parts := strings.SplitN(s, ":", 2)
-		if len(parts) < 2 {
-			continue
-		}
-		if parts[1] = strings.Trim(parts[1], " "); parts[1] == "" {
-			continue
-		}
-		parts[0] = strings.ToLower(parts[0])
-		for _, tag := range globals.indexableTags {
-			if parts[0] == tag {
-				dst = append(dst, tag+":"+parts[1])
-			}
-		}
-	}
-	return dst
 }
 
 func decodeAuthError(code int, id string, timestamp time.Time) *ServerComMessage {

@@ -6,25 +6,30 @@ import (
 	"encoding/json"
 	"errors"
 	"hash/fnv"
-	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tinode/chat/server/store"
 	t "github.com/tinode/chat/server/store/types"
-	rdb "gopkg.in/gorethink/gorethink.v3"
+	rdb "gopkg.in/gorethink/gorethink.v4"
 )
 
-// adapter hold RethinkDb connection data.
+// adapter holds RethinkDb connection data.
 type adapter struct {
-	conn   *rdb.Session
-	dbName string
+	conn    *rdb.Session
+	dbName  string
+	version int
 }
 
 const (
 	defaultHost     = "localhost:28015"
 	defaultDatabase = "tinode"
+
+	dbVersion = 100
+
+	adapterName = "rethinkdb"
 )
 
 type configType struct {
@@ -44,7 +49,7 @@ const (
 	// Maximum number of records to return
 	maxResults = 1024
 	// Maximum number of topic subscribers to return
-	maxSubscribers = 128
+	maxSubscribers = 256
 )
 
 // Open initializes rethinkdb session
@@ -89,10 +94,14 @@ func (a *adapter) Open(jsonconfig string) error {
 	opts.NodeRefreshInterval = time.Duration(config.NodeRefreshInterval) * time.Second
 
 	a.conn, err = rdb.Connect(opts)
+	if err != nil {
+		return err
+	}
 
 	rdb.SetTags("json")
+	a.version = -1
 
-	return err
+	return nil
 }
 
 // Close closes the underlying database connection
@@ -102,6 +111,7 @@ func (a *adapter) Close() error {
 		// Close will wait for all outstanding requests to finish
 		err = a.conn.Close()
 		a.conn = nil
+		a.version = -1
 	}
 	return err
 }
@@ -112,28 +122,74 @@ func (a *adapter) IsOpen() bool {
 	return a.conn != nil
 }
 
+// Read current database version
+func (a *adapter) getDbVersion() (int, error) {
+	resp, err := rdb.DB(a.dbName).Table("kvmeta").Get("version").Pluck("value").Run(a.conn)
+	if err != nil || resp.IsNil() {
+		return -1, err
+	}
+
+	var vers map[string]int
+	if err = resp.One(&vers); err != nil {
+		return -1, err
+	}
+	a.version = vers["value"]
+
+	return a.version, nil
+}
+
+// CheckDbVersion checks whether the actual DB version matches the expected version of this adapter.
+func (a *adapter) CheckDbVersion() error {
+	if a.version <= 0 {
+		a.getDbVersion()
+	}
+
+	if a.version != dbVersion {
+		return errors.New("Invalid database version " + strconv.Itoa(a.version) +
+			". Expected " + strconv.Itoa(dbVersion))
+	}
+
+	return nil
+}
+
+// GetName returns string that adapter uses to register itself with store.
+func (a *adapter) GetName() string {
+	return adapterName
+}
+
 // CreateDb initializes the storage. If reset is true, the database is first deleted losing all the data.
 func (a *adapter) CreateDb(reset bool) error {
 
 	// Drop database if exists, ignore error if it does not.
 	if reset {
-		rdb.DBDrop("tinode").RunWrite(a.conn)
+		rdb.DBDrop(a.dbName).RunWrite(a.conn)
 	}
 
-	if _, err := rdb.DBCreate("tinode").RunWrite(a.conn); err != nil {
+	if _, err := rdb.DBCreate(a.dbName).RunWrite(a.conn); err != nil {
+		return err
+	}
+
+	// Table with metadata key-value pairs.
+	if _, err := rdb.DB(a.dbName).TableCreate("kvmeta", rdb.TableCreateOpts{PrimaryKey: "key"}).RunWrite(a.conn); err != nil {
+		return err
+	}
+
+	// Record current DB version.
+	if _, err := rdb.DB(a.dbName).Table("kvmeta").Insert(
+		map[string]interface{}{"key": "version", "value": dbVersion}).RunWrite(a.conn); err != nil {
 		return err
 	}
 
 	// Users
-	if _, err := rdb.DB("tinode").TableCreate("users", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).TableCreate("users", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
 		return err
 	}
 	// Create secondary index on User.Tags array so user can be found by tags
-	if _, err := rdb.DB("tinode").Table("users").IndexCreate("Tags", rdb.IndexCreateOpts{Multi: true}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).Table("users").IndexCreate("Tags", rdb.IndexCreateOpts{Multi: true}).RunWrite(a.conn); err != nil {
 		return err
 	}
 	// Create secondary index for User.Devices.<hash>.DeviceId to ensure ID uniqueness across users
-	if _, err := rdb.DB("tinode").Table("users").IndexCreateFunc("DeviceIds",
+	if _, err := rdb.DB(a.dbName).Table("users").IndexCreateFunc("DeviceIds",
 		func(row rdb.Term) interface{} {
 			devices := row.Field("Devices")
 			return devices.Keys().Map(func(key rdb.Term) interface{} {
@@ -144,42 +200,47 @@ func (a *adapter) CreateDb(reset bool) error {
 	}
 
 	// User authentication records {unique, userid, secret}
-	if _, err := rdb.DB("tinode").TableCreate("auth", rdb.TableCreateOpts{PrimaryKey: "unique"}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).TableCreate("auth", rdb.TableCreateOpts{PrimaryKey: "unique"}).RunWrite(a.conn); err != nil {
 		return err
 	}
 	// Should be able to access user's auth records by user id
-	if _, err := rdb.DB("tinode").Table("auth").IndexCreate("userid").RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).Table("auth").IndexCreate("userid").RunWrite(a.conn); err != nil {
 		return err
 	}
 
 	// Subscription to a topic. The primary key is a Topic:User string
-	if _, err := rdb.DB("tinode").TableCreate("subscriptions", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).TableCreate("subscriptions", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
 		return err
 	}
-	if _, err := rdb.DB("tinode").Table("subscriptions").IndexCreate("User").RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).Table("subscriptions").IndexCreate("User").RunWrite(a.conn); err != nil {
 		return err
 	}
-	if _, err := rdb.DB("tinode").Table("subscriptions").IndexCreate("Topic").RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).Table("subscriptions").IndexCreate("Topic").RunWrite(a.conn); err != nil {
 		return err
 	}
 
 	// Topic stored in database
-	if _, err := rdb.DB("tinode").TableCreate("topics", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).TableCreate("topics", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
+		return err
+	}
+	// Create secondary index on Topic.Tags array so topics can be found by tags
+	// These tags are not unique as opposite to User.Tags.
+	if _, err := rdb.DB(a.dbName).Table("topics").IndexCreate("Tags", rdb.IndexCreateOpts{Multi: true}).RunWrite(a.conn); err != nil {
 		return err
 	}
 
 	// Stored message
-	if _, err := rdb.DB("tinode").TableCreate("messages", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).TableCreate("messages", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
 		return err
 	}
-	if _, err := rdb.DB("tinode").Table("messages").IndexCreateFunc("Topic_SeqId",
+	if _, err := rdb.DB(a.dbName).Table("messages").IndexCreateFunc("Topic_SeqId",
 		func(row rdb.Term) interface{} {
 			return []interface{}{row.Field("Topic"), row.Field("SeqId")}
 		}).RunWrite(a.conn); err != nil {
 		return err
 	}
 	// Compound index of hard-deleted messages
-	if _, err := rdb.DB("tinode").Table("messages").IndexCreateFunc("Topic_DelId",
+	if _, err := rdb.DB(a.dbName).Table("messages").IndexCreateFunc("Topic_DelId",
 		func(row rdb.Term) interface{} {
 			return []interface{}{row.Field("Topic"), row.Field("DelId")}
 		}).RunWrite(a.conn); err != nil {
@@ -187,7 +248,7 @@ func (a *adapter) CreateDb(reset bool) error {
 	}
 	// Compound multi-index of soft-deleted messages: each message gets multiple compound index entries like
 	// [[Topic, User1, DelId1], [Topic, User2, DelId2],...]
-	if _, err := rdb.DB("tinode").Table("messages").IndexCreateFunc("Topic_DeletedFor",
+	if _, err := rdb.DB(a.dbName).Table("messages").IndexCreateFunc("Topic_DeletedFor",
 		func(row rdb.Term) interface{} {
 			return row.Field("DeletedFor").Map(func(df rdb.Term) interface{} {
 				return []interface{}{row.Field("Topic"), df.Field("User"), df.Field("DelId")}
@@ -196,10 +257,10 @@ func (a *adapter) CreateDb(reset bool) error {
 		return err
 	}
 	// Log of deleted messages
-	if _, err := rdb.DB("tinode").TableCreate("dellog", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).TableCreate("dellog", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
 		return err
 	}
-	if _, err := rdb.DB("tinode").Table("dellog").IndexCreateFunc("Topic_DelId",
+	if _, err := rdb.DB(a.dbName).Table("dellog").IndexCreateFunc("Topic_DelId",
 		func(row rdb.Term) interface{} {
 			return []interface{}{row.Field("Topic"), row.Field("DelId")}
 		}).RunWrite(a.conn); err != nil {
@@ -208,11 +269,17 @@ func (a *adapter) CreateDb(reset bool) error {
 
 	// Index of unique user contact information as strings, such as "email:jdoe@example.com" or "tel:18003287448":
 	// {Id: <tag>, Source: <uid>} to ensure uniqueness of tags.
-	if _, err := rdb.DB("tinode").TableCreate("tagunique", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
+	if _, err := rdb.DB(a.dbName).TableCreate("tagunique", rdb.TableCreateOpts{PrimaryKey: "Id"}).RunWrite(a.conn); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// Indexable tag as stored in 'tagunique'
+type storedTag struct {
+	Id     string
+	Source string
 }
 
 // UserCreate creates a new user. Returns error and true if error is due to duplicate user name,
@@ -220,14 +287,10 @@ func (a *adapter) CreateDb(reset bool) error {
 func (a *adapter) UserCreate(user *t.User) error {
 	// Save user's tags to a separate table to ensure uniquness
 	// TODO(gene): add support for non-unique tags
-	if user.Tags != nil {
-		type tag struct {
-			Id     string
-			Source string
-		}
-		tags := make([]tag, 0, len(user.Tags))
+	if len(user.Tags) > 0 {
+		tags := make([]storedTag, 0, len(user.Tags))
 		for _, t := range user.Tags {
-			tags = append(tags, tag{Id: t, Source: user.Id})
+			tags = append(tags, storedTag{Id: t, Source: user.Id})
 		}
 		res, err := rdb.DB(a.dbName).Table("tagunique").Insert(tags).RunWrite(a.conn)
 		if err != nil {
@@ -286,8 +349,6 @@ func (a *adapter) DelAllAuthRecords(uid t.Uid) (int, error) {
 
 // Update user's authentication secret
 func (a *adapter) UpdAuthRecord(unique string, authLvl int, secret []byte, expires time.Time) (int, error) {
-	log.Println("Updating for unique", unique)
-
 	res, err := rdb.DB(a.dbName).Table("auth").Get(unique).Update(
 		map[string]interface{}{
 			"authLvl": authLvl,
@@ -299,9 +360,9 @@ func (a *adapter) UpdAuthRecord(unique string, authLvl int, secret []byte, expir
 // Retrieve user's authentication record
 func (a *adapter) GetAuthRecord(unique string) (t.Uid, int, []byte, time.Time, error) {
 	// Default() is needed to prevent Pluck from returning an error
-	rows, err := rdb.DB(a.dbName).Table("auth").Get(unique).Pluck(
+	row, err := rdb.DB(a.dbName).Table("auth").Get(unique).Pluck(
 		"userid", "secret", "expires", "authLvl").Default(nil).Run(a.conn)
-	if err != nil {
+	if err != nil || row.IsNil() {
 		return t.ZeroUid, 0, nil, time.Time{}, err
 	}
 
@@ -312,10 +373,9 @@ func (a *adapter) GetAuthRecord(unique string) (t.Uid, int, []byte, time.Time, e
 		Expires time.Time `gorethink:"expires"`
 	}
 
-	if !rows.Next(&record) {
-		return t.ZeroUid, 0, nil, time.Time{}, rows.Err()
+	if err = row.One(&record); err != nil {
+		return t.ZeroUid, 0, nil, time.Time{}, err
 	}
-	rows.Close()
 
 	// log.Println("loggin in user Id=", user.Uid(), user.Id)
 	return t.ParseUid(record.Userid), record.AuthLvl, record.Secret, record.Expires, nil
@@ -324,20 +384,15 @@ func (a *adapter) GetAuthRecord(unique string) (t.Uid, int, []byte, time.Time, e
 // UserGet fetches a single user by user id. If user is not found it returns (nil, nil)
 func (a *adapter) UserGet(uid t.Uid) (*t.User, error) {
 	row, err := rdb.DB(a.dbName).Table("users").Get(uid.String()).Run(a.conn)
-	if err == nil && !row.IsNil() {
-		var user t.User
-		if err = row.One(&user); err == nil {
-			return &user, nil
-		}
+	if err != nil || row.IsNil() {
 		return nil, err
 	}
 
-	if row != nil {
-		row.Close()
+	var user t.User
+	if err = row.One(&user); err != nil {
+		return nil, err
 	}
-
-	// If user does not exist, it returns nil, nil
-	return nil, err
+	return &user, nil
 }
 
 func (a *adapter) UserGetAll(ids ...t.Uid) ([]t.User, error) {
@@ -369,7 +424,7 @@ func (a *adapter) UserDelete(uid t.Uid, soft bool) error {
 		now := t.TimeNow()
 		_, err = q.Update(map[string]interface{}{"DeletedAt": now, "UpdatedAt": now}).RunWrite(a.conn)
 	} else {
-		_, err = q.Delete().Run(a.conn)
+		_, err = q.Delete().RunWrite(a.conn)
 	}
 	return err
 }
@@ -386,23 +441,8 @@ func (a *adapter) UserUpdateLastSeen(uid t.Uid, userAgent string, when time.Time
 	return err
 }
 
-/*
-func (a *RethinkDbAdapter) UserUpdateStatus(uid t.Uid, status interface{}) error {
-	update := map[string]interface{}{"Status": status}
-
-	_, err := rdb.DB(a.dbName).Table("users").Get(uid.String()).
-		Update(update, rdb.UpdateOpts{Durability: "soft"}).RunWrite(a.conn)
-
-	return err
-}
-*/
-
-func (a *adapter) ChangePassword(id t.Uid, password string) error {
-	return errors.New("ChangePassword: not implemented")
-}
-
+// UserUpdate updates user object. Use UserTagsUpdate when updating Tags.
 func (a *adapter) UserUpdate(uid t.Uid, update map[string]interface{}) error {
-	// FIXME(gene): add Tag re-indexing
 	_, err := rdb.DB(a.dbName).Table("users").Get(uid.String()).Update(update).RunWrite(a.conn)
 	return err
 }
@@ -443,22 +483,17 @@ func (a *adapter) TopicCreateP2P(initiator, invited *t.Subscription) error {
 
 func (a *adapter) TopicGet(topic string) (*t.Topic, error) {
 	// Fetch topic by name
-	rows, err := rdb.DB(a.dbName).Table("topics").Get(topic).Run(a.conn)
-	if err != nil {
+	row, err := rdb.DB(a.dbName).Table("topics").Get(topic).Run(a.conn)
+	if err != nil || row.IsNil() {
 		return nil, err
-	}
-
-	if rows.IsNil() {
-		rows.Close()
-		return nil, nil
 	}
 
 	var tt = new(t.Topic)
-	if err = rows.One(tt); err != nil {
+	if err = row.One(tt); err != nil {
 		return nil, err
 	}
 
-	return tt, rows.Err()
+	return tt, nil
 }
 
 // TopicsForUser loads user's contact list: p2p and grp topics, except for 'me' subscription.
@@ -611,7 +646,6 @@ func (a *adapter) UsersForTopic(topic string, keepDeleted bool) ([]t.Subscriptio
 				subs = append(subs, sub)
 			}
 		}
-
 		//log.Printf("RethinkDbAdapter.UsersForTopic users: %+v", subs)
 	}
 
@@ -645,17 +679,17 @@ func (a *adapter) TopicUpdateOnMessage(topic string, msg *t.Message) error {
 		SeqId int
 	}{msg.SeqId}
 
-	// Invite - 'me' topic
+	// FIXME(gene): remove 'me' update; no longer relevant
 	var err error
 	if strings.HasPrefix(topic, "usr") {
 		// Topic is passed as usrABCD, but the 'users' table expects Id without the 'usr' prefix.
 		user := t.ParseUserId(topic).String()
-		_, err = rdb.DB("tinode").Table("users").Get(user).
+		_, err = rdb.DB(a.dbName).Table("users").Get(user).
 			Update(update, rdb.UpdateOpts{Durability: "soft"}).RunWrite(a.conn)
 
 		// All other messages
 	} else {
-		_, err = rdb.DB("tinode").Table("topics").Get(topic).
+		_, err = rdb.DB(a.dbName).Table("topics").Get(topic).
 			Update(update, rdb.UpdateOpts{Durability: "soft"}).RunWrite(a.conn)
 	}
 
@@ -663,32 +697,28 @@ func (a *adapter) TopicUpdateOnMessage(topic string, msg *t.Message) error {
 }
 
 func (a *adapter) TopicUpdate(topic string, update map[string]interface{}) error {
-	_, err := rdb.DB("tinode").Table("topics").Get(topic).Update(update).RunWrite(a.conn)
+	_, err := rdb.DB(a.dbName).Table("topics").Get(topic).Update(update).RunWrite(a.conn)
 	return err
 }
 
 // Get a subscription of a user to a topic
 func (a *adapter) SubscriptionGet(topic string, user t.Uid) (*t.Subscription, error) {
 
-	rows, err := rdb.DB(a.dbName).Table("subscriptions").Get(topic + ":" + user.String()).Run(a.conn)
-	if err != nil {
+	row, err := rdb.DB(a.dbName).Table("subscriptions").Get(topic + ":" + user.String()).Run(a.conn)
+	if err != nil || row.IsNil() {
 		return nil, err
 	}
 
-	if rows.IsNil() {
-		rows.Close()
-		return nil, nil
-	}
-
 	var sub t.Subscription
-	if err = rows.One(&sub); err != nil {
+	if err = row.One(&sub); err != nil {
 		return nil, err
 	}
 
 	if sub.DeletedAt != nil {
-		return nil, rows.Err()
+		return nil, nil
 	}
-	return &sub, rows.Err()
+
+	return &sub, nil
 }
 
 // Update time when the user was last attached to the topic
@@ -721,6 +751,7 @@ func (a *adapter) SubsForUser(forUser t.Uid, keepDeleted bool) ([]t.Subscription
 	for rows.Next(&ss) {
 		subs = append(subs, ss)
 	}
+
 	return subs, rows.Err()
 }
 
@@ -771,6 +802,7 @@ func (a *adapter) SubsForTopic(topic string, keepDeleted bool) ([]t.Subscription
 		subs = append(subs, ss)
 		//log.Printf("SubsForTopic: loaded sub %#+v", ss)
 	}
+
 	return subs, rows.Err()
 }
 
@@ -813,23 +845,37 @@ func (a *adapter) SubsDelForTopic(topic string) error {
 }
 
 // Returns a list of users who match given tags, such as "email:jdoe@example.com" or "tel:18003287448".
-// Just search the 'users.Tags' for the given tags using respective index.
-func (a *adapter) FindSubs(uid t.Uid, query []interface{}) ([]t.Subscription, error) {
-	// Query may contain redundant records, i.e. the same email twice.
-	// User could be matched on multiple tags, i.e on email and phone#. Thus the query may
-	// return duplicate users. Thus the need for distinct.
-	rows, err := rdb.DB(a.dbName).Table("users").GetAllByIndex("Tags", query...).Limit(maxResults).
-		Pluck("Id", "Access", "CreatedAt", "UpdatedAt", "Public", "Tags").Distinct().Run(a.conn)
+// Searching the 'users.Tags' for the given tags using respective index.
+func (a *adapter) FindUsers(uid t.Uid, tags []string) ([]t.Subscription, error) {
+	index := make(map[string]struct{})
+	var query []interface{}
+	for _, tag := range tags {
+		query = append(query, tag)
+		index[tag] = struct{}{}
+	}
+
+	// Get users matched by tags, sort by number of matches from high to low.
+	rows, err := rdb.DB(a.dbName).
+		Table("users").
+		GetAllByIndex("Tags", query...).
+		Pluck("Id", "Access", "CreatedAt", "UpdatedAt", "Public", "Tags").
+		Group("Id").
+		Ungroup().
+		Map(func(row rdb.Term) rdb.Term {
+			return row.Field("reduction").
+				Nth(0).
+				Merge(map[string]interface{}{"MatchedTagsCount": row.Field("reduction").Count()})
+		}).
+		// Query may contain redundant records, i.e. the same tag twice.
+		// User could be matched on multiple tags, i.e on email and phone#. Thus the query may
+		// return duplicate users. Thus the need for distinct.
+		OrderBy(rdb.Desc("MatchedTagsCount")).
+		Limit(maxResults).
+		Run(a.conn)
 	if err != nil {
 		return nil, err
 	}
 
-	index := make(map[string]struct{})
-	for _, q := range query {
-		if tag, ok := q.(string); ok {
-			index[tag] = struct{}{}
-		}
-	}
 	var user t.User
 	var sub t.Subscription
 	var subs []t.Subscription
@@ -841,8 +887,6 @@ func (a *adapter) FindSubs(uid t.Uid, query []interface{}) ([]t.Subscription, er
 		sub.CreatedAt = user.CreatedAt
 		sub.UpdatedAt = user.UpdatedAt
 		sub.User = user.Id
-		// TODO(gene): maybe remove it
-		// sub.ModeWant, sub.ModeGiven = user.Access.Auth, user.Access.Auth
 		sub.SetPublic(user.Public)
 		// TODO: maybe report default access to user
 		// sub.SetDefaultAccess(user.Access.Auth, user.Access.Anon)
@@ -863,6 +907,205 @@ func (a *adapter) FindSubs(uid t.Uid, query []interface{}) ([]t.Subscription, er
 
 }
 
+// Returns a list of topics with matching tags.
+// Searching the 'topics.Tags' for the given tags using respective index.
+func (a *adapter) FindTopics(tags []string) ([]t.Subscription, error) {
+	index := make(map[string]struct{})
+	var query []interface{}
+	for _, tag := range tags {
+		query = append(query, tag)
+		index[tag] = struct{}{}
+	}
+
+	/*
+	   Javascript query we are replicating here in Go:
+	   r.db('tinode').table('users')
+	   	.getAll("email:alice@example.com", "email:bob@example.com", "tel:17025550002", {index: 'Tags'})
+	   	.group("Id")
+	   	.ungroup()
+	   	.map(function(row) {
+	   		return row.getField('reduction')
+	   			.nth(0)
+	   			.merge({
+	   				merge_count: row.getField('reduction').count()
+	   			})
+	   	})
+	   	.orderBy(r.desc("merge_count"))
+	*/
+
+	rows, err := rdb.DB(a.dbName).
+		Table("topics").
+		GetAllByIndex("Tags", query...).
+		Pluck("Id", "Access", "CreatedAt", "UpdatedAt", "Public", "Tags").
+		Group("Id").
+		Ungroup().
+		Map(func(row rdb.Term) rdb.Term {
+			return row.Field("reduction").
+				Nth(0).
+				Merge(map[string]interface{}{"MatchedTagsCount": row.Field("reduction").Count()})
+		}).
+		OrderBy(rdb.Desc("MatchedTagsCount")).
+		Limit(maxResults).
+		Run(a.conn)
+	if err != nil {
+		return nil, err
+	}
+
+	var topic t.Topic
+	var sub t.Subscription
+	var subs []t.Subscription
+	for rows.Next(&topic) {
+		sub.CreatedAt = topic.CreatedAt
+		sub.UpdatedAt = topic.UpdatedAt
+		sub.Topic = topic.Id
+		sub.SetPublic(topic.Public)
+		// TODO: maybe report default access to user
+		// sub.SetDefaultAccess(user.Access.Auth, user.Access.Anon)
+		tags := make([]string, 0, 1)
+		for _, tag := range topic.Tags {
+			if _, ok := index[tag]; ok {
+				tags = append(tags, tag)
+			}
+		}
+		sub.Private = tags
+		subs = append(subs, sub)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return subs, nil
+
+}
+
+// UserTagsUpdate updates user's Tags. 'unique' contains the prefixes of tags which are
+// treated as unique, i.e. 'email' or 'tel'.
+func (a *adapter) UserTagsUpdate(uid t.Uid, unique, tags t.StringSlice) error {
+	user, err := a.UserGet(uid)
+	if err != nil {
+		return err
+	}
+
+	added, removed := tagsUniqueDelta(unique, user.Tags, tags)
+	if err := a.updateUniqueTags(user.Id, added, removed); err != nil {
+		return err
+	}
+
+	return a.UserUpdate(uid, map[string]interface{}{"Tags": tags})
+}
+
+// TopicTagsUpdate updates topic's tags.
+// - name is the name of the topic to update
+// - unique is the list of prefixes to treat as unique.
+// - tags are the new tags.
+func (a *adapter) TopicTagsUpdate(name string, unique, tags t.StringSlice) error {
+	topic, err := a.TopicGet(name)
+	if err != nil {
+		return err
+	}
+
+	added, removed := tagsUniqueDelta(unique, topic.Tags, tags)
+	if err := a.updateUniqueTags(name, added, removed); err != nil {
+		return err
+	}
+
+	return a.TopicUpdate(name, map[string]interface{}{"Tags": tags})
+}
+
+func (a *adapter) updateUniqueTags(source string, added, removed []string) error {
+	if added != nil && len(added) > 0 {
+		toAdd := make([]storedTag, 0, len(added))
+		for _, tag := range added {
+			toAdd = append(toAdd, storedTag{Id: tag, Source: source})
+		}
+		res, err := rdb.DB(a.dbName).Table("tagunique").Insert(toAdd).RunWrite(a.conn)
+		if err != nil {
+			if res.Inserted > 0 {
+				// Something went wrong, do best effort deletion of inserted tags
+				rdb.DB(a.dbName).Table("tagunique").GetAll(added).
+					Filter(map[string]interface{}{"Source": source}).Delete().RunWrite(a.conn)
+			}
+
+			if rdb.IsConflictErr(err) {
+				return errors.New("duplicate tag(s)")
+			}
+			return err
+		}
+	}
+
+	if removed != nil && len(removed) > 0 {
+		_, err := rdb.DB(a.dbName).Table("tagunique").GetAll(removed).
+			Filter(map[string]interface{}{"Source": source}).Delete().RunWrite(a.conn)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// tagsUniqueDelta extracts the lists of added unique tags and removed unique tags:
+//   added :=  newTags - (oldTags & newTags) -- present in new but missing in old
+//   removed := oldTags - (newTags & oldTags) -- present in old but missing in new
+func tagsUniqueDelta(unique, oldTags, newTags []string) (added, removed []string) {
+	if oldTags == nil {
+		return filterUniqueTags(unique, newTags), nil
+	}
+	if newTags == nil {
+		return nil, filterUniqueTags(unique, oldTags)
+	}
+
+	sort.Strings(oldTags)
+	sort.Strings(newTags)
+
+	// Match old tags against the new tags and separate removed tags from added.
+	iold, inew := 0, 0
+	lold, lnew := len(oldTags), len(newTags)
+	for iold < lold || inew < lnew {
+		if (iold == lold && inew < lnew) || oldTags[iold] > newTags[inew] {
+			// Present in new, missing in old: added
+			added = append(added, newTags[inew])
+			inew++
+
+		} else if (inew == lnew && iold < lold) || oldTags[iold] < newTags[inew] {
+			// Present in old, missing in new: removed
+			removed = append(removed, oldTags[iold])
+
+			iold++
+
+		} else {
+			// present in both
+			if iold < lold {
+				iold++
+			}
+			if inew < lnew {
+				inew++
+			}
+		}
+	}
+	return filterUniqueTags(unique, added), filterUniqueTags(unique, removed)
+}
+
+func filterUniqueTags(unique, tags []string) []string {
+	var out []string
+	if unique != nil && len(unique) > 0 && tags != nil {
+		for _, s := range tags {
+			parts := strings.SplitN(s, ":", 2)
+
+			if len(parts) < 2 {
+				continue
+			}
+
+			for _, u := range unique {
+				if parts[0] == u {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // Messages
 func (a *adapter) MessageSave(msg *t.Message) error {
 	msg.SetUid(store.GetUid())
@@ -873,7 +1116,7 @@ func (a *adapter) MessageSave(msg *t.Message) error {
 func (a *adapter) MessageGetAll(topic string, forUser t.Uid, opts *t.BrowseOpt) ([]t.Message, error) {
 	//log.Println("Loading messages for topic ", topic, opts)
 
-	var limit = 1024 // TODO(gene): pass into adapter as a config param
+	var limit = maxResults
 	var lower, upper interface{}
 
 	upper = rdb.MaxVal
@@ -924,8 +1167,6 @@ func (a *adapter) MessageGetAll(topic string, forUser t.Uid, opts *t.BrowseOpt) 
 
 // Get ranges of deleted messages
 func (a *adapter) MessageGetDeleted(topic string, forUser t.Uid, opts *t.BrowseOpt) ([]t.DelMessage, error) {
-	log.Println("Loading ids of deleted messages for topic", topic, opts)
-
 	var limit = 1024 // TODO(gene): pass into adapter as a config param
 	var lower, upper interface{}
 
@@ -1113,7 +1354,6 @@ func (a *adapter) DeviceGetAll(uids ...t.Uid) (map[t.Uid][]t.DeviceDef, int, err
 	for rows.Next(&row) {
 		if row.Devices != nil && len(row.Devices) > 0 {
 			if err := uid.UnmarshalText([]byte(row.Id)); err != nil {
-				log.Print(err.Error())
 				continue
 			}
 
@@ -1139,5 +1379,5 @@ func (a *adapter) DeviceDelete(uid t.Uid, deviceID string) error {
 }
 
 func init() {
-	store.Register("rethinkdb", &adapter{})
+	store.RegisterAdapter(adapterName, &adapter{})
 }
